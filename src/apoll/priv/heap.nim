@@ -97,7 +97,7 @@ proc shiftUp(h: var InstruHeap, n: var InstruHeapNode) {.inline.} =
     swap(h, n.parent[], n)
 
 proc insert*(h: var InstruHeap, n: var InstruHeapNode) =
-  assert n.isEmpty
+  assert n.isEmpty()
 
   n.heap = h.addr
 
@@ -110,7 +110,7 @@ proc insert*(h: var InstruHeap, n: var InstruHeapNode) =
   shiftUp(h, n)
 
 proc remove*(n: var InstruHeapNode) =
-  assert not n.isEmpty
+  assert not n.isEmpty()
 
   let h = n.heap
 
@@ -125,6 +125,8 @@ proc remove*(n: var InstruHeapNode) =
   if c == n.addr:
     if c == h.top:
       h.top = nil
+
+    n.initEmpty()
     return
 
   c[] = n
