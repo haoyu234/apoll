@@ -1,14 +1,33 @@
 import ./priv/heap
-import ./priv/epoll
 import ./priv/macros
 import ./priv/errnos
 
 import yasync
 
-when defined(windows):
+type EventCore = enum
+  kEpoll
+  kKqueue
+
+when defined(macosx) or defined(freebsd) or defined(netbsd) or defined(openbsd) or
+    defined(dragonfly):
+  import std/kqueue
+
+  const eventCore = kKqueue
+elif defined(windows):
+  import ./priv/wepoll
+
   import std/winlean
+
+  type EventCoreHandle = WEpoll
+
+  const eventCore = kEpoll
 else:
+  import std/epoll
   import std/posix
+
+  type EventCoreHandle = cint
+
+  const eventCore = kEpoll
 
 import std/times
 import std/tables
@@ -31,7 +50,7 @@ type
   Source* = object
     id*: uint64
     kind*: HandleType
-    socket*: EpollSocketHandle
+    socket*: SocketHandle
 
   SoltRange = kRead .. kWrite
 
@@ -46,29 +65,65 @@ type
     time: MonoTime
     node: InstruHeapNode
 
-  PollErrorObj = object of OsError
-
   Poller* = ref PollerObj
   PollerObj = object
     time: MonoTime
-    efd: EpollHandle
+    poll: EventCoreHandle
     uniq: uint64
     timers: InstruHeap
     infos: Table[uint64, HandleData]
 
-proc newPollError(osErr: OSErrorCode): ref PollErrorObj =
-  (ref PollErrorObj)(errorCode: int32(osErr), msg: osErrorMsg(osErr))
+when eventCore == kEpoll:
+  proc createEpoll(): EventCoreHandle =
+    let poll = epoll_create(1024)
 
-proc raisePollError(osErr: OSErrorCode) =
-  raise (ref PollErrorObj)(errorCode: int32(osErr), msg: osErrorMsg(osErr))
+    when defined(windows):
+      if poll.isNil:
+        raiseOSError(osLastError())
+    else:
+      if poll < 0:
+        raiseOSError(osLastError())
+
+    poll
+
+  proc modifyEpoll(
+      poll: EventCoreHandle,
+      id: uint64,
+      socket: SocketHandle,
+      op: cint,
+      events: set[Event],
+  ): cint {.raises: [].} =
+    var epv = default(EpollEvent)
+    epv.events = EPOLLONESHOT or EPOLLRDHUP
+    epv.data.u64 = id
+
+    if kRead in events:
+      epv.events = epv.events or EPOLLIN
+    if kWrite in events:
+      epv.events = epv.events or EPOLLOUT
+
+    let err = epoll_ctl(poll, op, socket, epv.addr)
+    if err != 0:
+      result = errno
+
+  proc closeEpoll(poll: EventCoreHandle): cint {.raises: [].} =
+    when defined(windows):
+      let err = epoll_close(poll)
+    else:
+      let err = close(poll)
+
+    if err != 0:
+      result = errno
+
+elif eventCore == kKqueue:
+  discard
 
 proc `=destroy`(p: PollerObj) =
   assert p.infos.len <= 0
   assert p.timers.len <= 0
 
-  let err = epoll_close(p.efd)
-  if err != 0:
-    discard
+  when eventCore == kEpoll:
+    discard closeEpoll(p.poll)
 
 proc lessThen(a, b: var InstruHeapNode): bool =
   let t1 = containerOf(a.addr, TimerEnvObj, node)
@@ -77,31 +132,14 @@ proc lessThen(a, b: var InstruHeapNode): bool =
   if t1.time < t2.time or (t1.time == t2.time and t1.source.id < t2.source.id):
     result = true
 
-proc modifyEpoll(
-    poller: Poller, id: uint64, fd: EpollSocketHandle, op: cint, events: set[Event]
-): cint =
-  var epv = default(EpollEvent)
-  epv.events = EPOLLONESHOT or EPOLLRDHUP
-  epv.data.u64 = id
-
-  if kRead in events:
-    epv.events = epv.events or EPOLLIN
-  if kWrite in events:
-    epv.events = epv.events or EPOLLOUT
-
-  let res = epoll_ctl(poller.efd, op, cast[EpollSocketHandle](fd), epv.addr)
-  if res != 0:
-    result = errno
-
 proc newPoller*(): Poller =
-  let efd = epoll_create(1024)
-  if cast[int](efd) <= 0:
-    raisePollError(osLastError())
+  when eventCore == kEpoll:
+    let poll = createEpoll()
 
   let poller = Poller()
 
   poller.time = getMonoTime()
-  poller.efd = efd
+  poller.poll = poll
   poller.timers.initEmpty(lessThen)
 
   poller
@@ -120,11 +158,12 @@ proc getPriv(poller: Poller, id: uint64): ptr HandleData =
 proc registerSocket*(poller: Poller, socket: SocketHandle): Source =
   result.kind = kSocket
   result.id = succ(poller.uniq)
-  result.socket = cast[EpollSocketHandle](socket)
+  result.socket = socket
 
-  let err = modifyEpoll(poller, result.id, result.socket, EPOLL_CTL_ADD, {})
-  if err != 0:
-    raisePollError(osLastError())
+  when eventCore == kEpoll:
+    let err = modifyEpoll(poller.poll, result.id, result.socket, EPOLL_CTL_ADD, {})
+    if err != 0:
+      raiseOSError(osLastError())
 
   poller.uniq = result.id
   poller.infos[result.id] = default(HandleData)
@@ -132,7 +171,7 @@ proc registerSocket*(poller: Poller, socket: SocketHandle): Source =
 proc registerTimer*(poller: Poller): Source =
   result.kind = kTimer
   result.id = succ(poller.uniq)
-  result.socket = cast[EpollSocketHandle](0)
+  result.socket = cast[SocketHandle](0)
 
   poller.uniq = result.id
   poller.infos[result.id] = default(HandleData)
@@ -141,12 +180,13 @@ proc removeTimer(poller: Poller, timer: TimerEnv) =
   if not timer.node.isEmpty():
     remove(timer.node)
 
-proc unregisterHandle*(poller: Poller, source: Source) {.raises: [].} =
+proc unregisterSource*(poller: Poller, source: Source) {.raises: [].} =
   var data: HandleData
   if poller.infos.pop(source.id, data):
     case source.kind
     of kSocket:
-      discard modifyEpoll(poller, source.id, source.socket, EPOLL_CTL_DEL, {})
+      when eventCore == kEpoll:
+        discard modifyEpoll(poller.poll, source.id, source.socket, EPOLL_CTL_DEL, {})
 
       for idx in SoltRange:
         let env = move data.solt[idx]
@@ -175,51 +215,54 @@ proc completeEnv(poller: Poller, data: ptr HandleData, env: TimerEnv, res: Event
       data.solt[env.want] = nil
 
       if env.source.id > 0:
-        let err = modifyEpoll(
-          poller, env.source.id, env.source.socket, EPOLL_CTL_MOD, data.registeredEvents
-        )
-        if err != 0:
-          fail(env, newPollError(osLastError()))
-          return
+        when eventCore == kEpoll:
+          let err = modifyEpoll(
+            poller.poll, env.source.id, env.source.socket, EPOLL_CTL_MOD,
+            data.registeredEvents,
+          )
+          if err != 0:
+            fail(env, newOSError(osLastError()))
+            return
     else:
       data.solt[kRead] = nil
 
   complete(env, res)
 
-proc waitEpoll(poller: Poller, timeout: int) =
-  var epvs: array[MAX_EPOLL_EVENTS, EpollEvent]
-  let count = epoll_wait(poller.efd, epvs[0].addr, MAX_EPOLL_EVENTS, cint(timeout))
+when eventCore == kEpoll:
+  proc waitEpoll(poller: Poller, timeout: int) =
+    var epvs: array[MAX_EPOLL_EVENTS, EpollEvent]
+    let count = epoll_wait(poller.poll, epvs[0].addr, MAX_EPOLL_EVENTS, cint(timeout))
 
-  if count < 0:
-    if errno != EINTR:
-      raisePollError(osLastError())
-    return
+    if count < 0:
+      if errno != EINTR:
+        raiseOSError(osLastError())
+      return
 
-  for i in 0 ..< count:
-    let mask = uint32(epvs[i].events)
-    let id = epvs[i].data.u64
+    for i in 0 ..< count:
+      let mask = uint32(epvs[i].events)
+      let id = epvs[i].data.u64
 
-    if id <= 0:
-      continue
+      if id <= 0:
+        continue
 
-    let data = getPriv(poller, id)
-    if data.isNil:
-      assert false
+      let data = getPriv(poller, id)
+      if data.isNil:
+        assert false
 
-    var events = default(set[Event])
+      var events = default(set[Event])
 
-    if (mask and EPOLLERR) != 0 or (mask and EPOLLHUP) != 0:
-      events.incl(kRead)
-      events.incl(kWrite)
-    else:
-      if (mask and EPOLLOUT) != 0:
-        events.incl(kWrite)
-
-      if (mask and EPOLLIN) != 0:
+      if (mask and EPOLLERR) != 0 or (mask and EPOLLHUP) != 0:
         events.incl(kRead)
+        events.incl(kWrite)
+      else:
+        if (mask and EPOLLOUT) != 0:
+          events.incl(kWrite)
 
-    for event in events:
-      completeEnv(poller, data, data.solt[event], event)
+        if (mask and EPOLLIN) != 0:
+          events.incl(kRead)
+
+      for event in events:
+        completeEnv(poller, data, data.solt[event], event)
 
 proc runTimer(poller: Poller) =
   while not poller.timers.isEmpty:
@@ -252,7 +295,8 @@ proc poll*(poller: Poller, milliseconds: int = -1) =
     else:
       milliseconds
 
-  waitEpoll(poller, time)
+  when eventCore == kEpoll:
+    waitEpoll(poller, time)
 
   updateTimeNow(poller)
 
@@ -274,10 +318,12 @@ proc pollImpl(
     let events = data.registeredEvents + {want}
 
     if source.kind != kTimer:
-      let err = modifyEpoll(poller, source.id, source.socket, EPOLL_CTL_MOD, events)
-      if err != 0:
-        fail(env, newPollError(osLastError()))
-        return
+      when eventCore == kEpoll:
+        let err =
+          modifyEpoll(poller.poll, source.id, source.socket, EPOLL_CTL_MOD, events)
+        if err != 0:
+          fail(env, newOSError(osLastError()))
+          return
 
       data.solt[want] = env
     else:
@@ -313,7 +359,7 @@ proc poll*(
 proc sleep*(poller: Poller, milliseconds: int) {.async.} =
   assert milliseconds >= 0
 
-  let source = Source(id: 0, kind: kTimer, socket: default(EpollSocketHandle))
+  let source = Source(id: 0, kind: kTimer, socket: default(SocketHandle))
 
   let res = await pollImpl(poller, source, nil, kNotify, milliseconds)
   assert res == kNotify
