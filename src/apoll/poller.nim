@@ -150,9 +150,9 @@ proc `=destroy`(p: PollerObj) =
   when eventCore == kEpoll:
     discard closeEpoll(p.poll)
 
-proc lessThen(a, b: var InstruHeapNode): bool =
-  let t1 = containerOf(a.addr, TimerEnvObj, node)
-  let t2 = containerOf(b.addr, TimerEnvObj, node)
+proc lessThen(a, b: ptr InstruHeapNode): bool =
+  let t1 = containerOf(a, TimerEnvObj, node)
+  let t2 = containerOf(b, TimerEnvObj, node)
 
   if t1.time < t2.time or (t1.time == t2.time and t1.source.id < t2.source.id):
     result = true

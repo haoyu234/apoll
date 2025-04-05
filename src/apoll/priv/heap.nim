@@ -23,13 +23,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import std/bitops
+
 type
-  LessThen = proc(a, b: var InstruHeapNode): bool {.raises: [].}
+  InstruLessThen = proc(a, b: ptr InstruHeapNode): bool {.raises: [].}
 
   InstruHeap* = object
     len: int
     top: ptr InstruHeapNode
-    lessThan: LessThen
+    lessThen: InstruLessThen
 
   InstruHeapNode* = object
     heap: ptr InstruHeap
@@ -37,8 +39,8 @@ type
     right: ptr InstruHeapNode
     parent: ptr InstruHeapNode
 
-  TraverseResult = object
-    parentAddr: ptr ptr InstruHeapNode
+  InstruTraverseResult = object
+    parentAddr: ptr InstruHeapNode
     nodeAddr: ptr ptr InstruHeapNode
 
 template len*(h: InstruHeap): int =
@@ -53,97 +55,91 @@ template isEmpty*(h: InstruHeap): bool =
 template isEmpty*(n: InstruHeapNode): bool =
   isNil(n.heap)
 
-proc initEmpty*(h: var InstruHeap, lessThan: LessThen) {.inline.} =
+proc initEmpty*(h: var InstruHeap, lessThen: InstruLessThen) {.inline.} =
   h.len = 0
   h.top = nil
-  h.lessThan = lessThan
+  h.lessThen = lessThen
 
 proc initEmpty*(h: var InstruHeapNode) {.inline.} =
   reset(h)
 
-proc swap(h: var InstruHeap, a, b: var InstruHeapNode) =
-  swap(a, b)
+proc swap(h: ptr InstruHeap, a, b: ptr InstruHeapNode) {.inline.} =
+  swap(a.left, b.left)
+  swap(a.right, b.right)
+  swap(a.parent, b.parent)
 
-  a.parent = b.addr
+  a.parent = b
 
-  var sibling = block:
-    if b.left == b.addr:
-      b.left = a.addr
+  let sibling =
+    if b.left == b:
+      b.left = a
       b.right
     else:
-      b.right = a.addr
+      b.right = a
       b.left
 
   if not isNil(sibling):
-    sibling[].parent = b.addr
+    sibling.parent = b
 
   if not isNil(a.left):
-    a.left.parent = a.addr
+    a.left.parent = a
 
   if not isNil(a.right):
-    a.right.parent = a.addr
+    a.right.parent = a
 
   if isNil(b.parent):
-    h.top = b.addr
-  elif b.parent.left == a.addr:
-    b.parent.left = b.addr
+    h.top = b
+  elif b.parent.left == a:
+    b.parent.left = b
   else:
-    b.parent.right = b.addr
+    b.parent.right = b
 
-proc traverse(h: var InstruHeap, n: int): TraverseResult =
-  var k: uint32 = 0
-  var path: uint32 = 0
-
-  var num = uint32(n)
-  while num >= 2:
-    path = (path shl 1) or (num and 0x1)
-    num = num shr 1
-    inc k
-
+proc traverse(h: ptr InstruHeap, n: int): InstruTraverseResult {.inline.} =
   var c = h.top.addr
-  var p = h.top.addr
+  var p = default(ptr InstruHeapNode)
 
-  while k > 0:
-    p = c
-    if (path and 0x1) > 0:
-      c = c[].right.addr
-    else:
-      c = c[].left.addr
+  if n >= 2:
+    var count = sizeof(n) * 8 - countLeadingZeroBits(n) - 1
+    while count > 0:
+      dec count
 
-    path = path shr 1
-    dec k
+      p = c[]
 
-  TraverseResult(parentAddr: p, nodeAddr: c)
+      let mask = 1 shl count
+      if (n and mask) > 0:
+        c = c.right.addr
+      else:
+        c = c.left.addr
 
-proc shiftUp(h: var InstruHeap, n: var InstruHeapNode) {.inline.} =
-  let lessThan = h.lessThan
+  InstruTraverseResult(parentAddr: p, nodeAddr: c)
 
-  while not isNil(n.parent) and lessThan(n, n.parent[]):
-    swap(h, n.parent[], n)
+proc shiftUp(h: ptr InstruHeap, n: ptr InstruHeapNode) {.inline.} =
+  let lessThen = h.lessThen
+
+  while not isNil(n.parent) and lessThen(n, n.parent):
+    swap(h, n.parent, n)
 
 proc insert*(h: var InstruHeap, n: var InstruHeapNode) =
   assert n.isEmpty()
 
-  n.heap = h.addr
-
-  let r = traverse(h, succ h.len)
-  n.parent = r.parentAddr[]
-  r.nodeAddr[] = n.addr
-
   inc h.len
 
-  shiftUp(h, n)
+  let r = traverse(h.addr, h.len)
+  r.nodeAddr[] = n.addr
+
+  n.heap = h.addr
+  n.parent = r.parentAddr
+
+  shiftUp(h.addr, n.addr)
 
 proc remove*(n: var InstruHeapNode) =
   assert not n.isEmpty()
 
   let h = n.heap
 
-  var c = block:
-    let r = traverse(h[], h.len)
-    var result = r.nodeAddr[]
-    r.nodeAddr[] = nil
-    result
+  let c = block:
+    let r = traverse(h, h.len)
+    move r.nodeAddr[]
 
   dec h.len
 
@@ -156,11 +152,11 @@ proc remove*(n: var InstruHeapNode) =
 
   c[] = n
 
-  if not isNil(c.left):
-    c.left.parent = c
+  if not isNil(n.left):
+    n.left.parent = c
 
-  if not isNil(c.right):
-    c.right.parent = c
+  if not isNil(n.right):
+    n.right.parent = c
 
   if isNil(n.parent):
     h.top = c
@@ -169,24 +165,24 @@ proc remove*(n: var InstruHeapNode) =
   else:
     n.parent.right = c
 
-  let lessThan = h.lessThan
+  let lessThen = h.lessThen
 
   while true:
     var s = c
 
-    if not isNil(c.left) and lessThan(c.left[], s[]):
+    if not isNil(c.left) and lessThen(c.left, s):
       s = c.left
 
-    if not isNil(c.right) and lessThan(c.right[], s[]):
+    if not isNil(c.right) and lessThen(c.right, s):
       s = c.right
 
     if s != c:
-      swap(h[], c[], s[])
+      swap(h, c, s)
       continue
 
     break
 
-  shiftUp(h[], c[])
+  shiftUp(h, c)
 
   n.initEmpty()
 
