@@ -77,11 +77,11 @@ type
     kind*: HandleType
     socket*: SocketHandle
 
-  SoltRange = kRead .. kWrite
+  SlotRange = kRead .. kWrite
 
   HandleData = object
     registeredEvents: set[Event]
-    solt: array[SoltRange, TimerEnv]
+    slot: array[SlotRange, TimerEnv]
 
   TimerEnv = ptr TimerEnvObj
   TimerEnvObj = object of Cont[Event]
@@ -213,8 +213,8 @@ proc unregisterSource*(poller: Poller, source: Source) {.raises: [].} =
       when eventCore == kEpoll:
         discard modifyEpoll(poller.poll, source.id, source.socket, EPOLL_CTL_DEL, {})
 
-      for idx in SoltRange:
-        let env = move data.solt[idx]
+      for idx in SlotRange:
+        let env = move data.slot[idx]
         if env.isNil:
           continue
 
@@ -222,7 +222,7 @@ proc unregisterSource*(poller: Poller, source: Source) {.raises: [].} =
 
         complete(env, kError)
     of kTimer:
-      let env = move data.solt[kRead]
+      let env = move data.slot[kRead]
       if env.isNil:
         return
 
@@ -237,7 +237,7 @@ proc completeEnv(poller: Poller, data: ptr HandleData, env: TimerEnv, res: Event
     data.registeredEvents.excl(env.want)
 
     if env.source.kind != kTimer:
-      data.solt[env.want] = nil
+      data.slot[env.want] = nil
 
       if env.source.id > 0:
         when eventCore == kEpoll:
@@ -249,7 +249,7 @@ proc completeEnv(poller: Poller, data: ptr HandleData, env: TimerEnv, res: Event
             fail(env, newOSError(osLastError()))
             return
     else:
-      data.solt[kRead] = nil
+      data.slot[kRead] = nil
 
   complete(env, res)
 
@@ -287,7 +287,7 @@ when eventCore == kEpoll:
           events.incl(kRead)
 
       for event in events:
-        completeEnv(poller, data, data.solt[event], event)
+        completeEnv(poller, data, data.slot[event], event)
 
 proc runTimer(poller: Poller) =
   while not poller.timers.isEmpty:
@@ -350,9 +350,9 @@ proc pollImpl(
           fail(env, newOSError(osLastError()))
           return
 
-      data.solt[want] = env
+      data.slot[want] = env
     else:
-      data.solt[kRead] = env
+      data.slot[kRead] = env
 
     data.registeredEvents = events
 
@@ -366,16 +366,16 @@ proc poll*(
 ): Event {.async.} =
   assert milliseconds >= -1
   assert (source.kind == kTimer and want == kNotify) or
-    (source.kind == kSocket and want in low(SoltRange) .. high(SoltRange))
+    (source.kind == kSocket and want in low(SlotRange) .. high(SlotRange))
 
   let data = getPriv(poller, source.id)
   if data.isNil:
     assert false
 
   if source.kind != kTimer:
-    assert data.solt[want].isNil
+    assert data.slot[want].isNil
   else:
-    assert data.solt[kRead].isNil
+    assert data.slot[kRead].isNil
 
   assert not (want in data.registeredEvents)
 
