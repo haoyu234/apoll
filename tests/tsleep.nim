@@ -10,15 +10,16 @@ test "sleep":
   let milliseconds = 1234
 
   let a = getMonoTime()
-  waitFor p, sleep(p, milliseconds)
+  let fut = sleep(p, milliseconds)
+  waitFor(p, fut)
 
   let dur = getMonoTime() - a
   check dur.inMilliseconds == milliseconds
 
 test "timer":
-  let timer = registerTimer(p)
+  let timer = addTimer(p)
   defer:
-    unregisterSource(p, timer)
+    removeSource(p, timer)
 
   let milliseconds = 1234
 
